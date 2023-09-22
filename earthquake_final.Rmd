@@ -1,0 +1,1161 @@
+---
+title: "earthquake_final"
+author: "Will Graham"
+date: "2023-07-24"
+output: pdf_document
+editor_options: 
+  markdown: 
+    wrap: 80
+---
+
+# Project Description
+
+For the University of Edinburgh Statistics with Data Science MSc Dissertation -
+Forecasting Earthquakes
+
+We can gain insight into how earthquake aftershocks evolve temporally with the
+Epidemic Type Aftershock Sequence (ETAS) model. This code file evaluates the
+posterior parameter fits of the ETAS model when training on earthquake sequences
+with varying characteristics. Furthermore, this code also serves as a framework
+for measuring the consequences of incorrectly estimating parameters.
+
+Supervised by Dr. Finn Lindgren and Dr. Daniel Paulin.
+
+## Libraries, Packages, and Functions
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+# names of packages used throughout the code
+package_names<-c("patchwork","ETAS.inlabru","ggplot2","stats","GGally","MASS","xtable")
+
+# check if packages are installed
+package_check <- package_names %in% installed.packages()
+
+# list of packages to install
+packages_to_install <- package_names[!package_check]
+
+# install the packages that are not currently installed
+for (i in packages_to_install){
+  install.packages(i)
+}
+
+library("patchwork")
+library(ETAS.inlabru)
+library(ggplot2)
+library(stats)
+library(GGally)
+library(MASS)
+library(xtable)
+
+# INLA settings
+num.cores <- 2
+future::plan(future::multisession, workers = num.cores)
+INLA::inla.setOption(num.threads = num.cores)
+```
+
+Load functions used throughout the file
+
+```{r, warning=FALSE, message=FALSE}
+# generate a time series of earthquakes with respect to the Hawkes' process
+gen.ETAS <- function(Ht=NULL, T1=0, T2=365, mu = 0.30216930, 
+                     K = 0.13821396, alpha = 2.43754785, c = 0.07019829,
+                     p = 1.17793514){
+  
+  # the true parameters are obtained by fitting an ETAS model on real data
+  true.param <- list(mu = mu, K = K, alpha = alpha, c = c, p = p)
+  
+  M0 <- 2.5
+  beta.p <- 2.353 # 1 / mean(aquila.bru$magnitudes - M0)
+  
+  synth.cat.list <- generate_temporal_ETAS_synthetic(
+    theta = true.param,
+    beta.p = beta.p,
+    M0 = M0,
+    T1 = T1,
+    T2 = T2,
+    Ht = Ht,
+    ncore = 1)
+  
+  # combine catalogues
+  synth.cat.df <- do.call(rbind, synth.cat.list)
+  
+  # prepare dataframe
+  synth.cat.df <- synth.cat.df[order(synth.cat.df$ts),]
+  return(synth.cat.df)
+}  
+
+
+
+# function to fit the Hawkes process parameters with synthetic data
+fit.ETAS <- function(df, T1 = 0, T2 = 365){
+  
+  # fit synthetic data
+  fit <- Temporal.ETAS(
+    total.data <- df,
+    M0 <- 2.5,
+    T1 <- T1,
+    T2 <- T2,
+    link.functions <- link.f,
+    coef.t. <- 1,
+    delta.t. <- 0.1,
+    n.max. <- 5,
+    bru.opt = bru.opt.list)
+  
+  # create input list
+  input_list <- list(
+    model.fit = fit,
+    link.functions = link.f)
+  
+  # get marginal posterior information
+  post.list <- get_posterior_param(input.list = input_list)
+  
+  # Get posterior samples from real data
+  post.samp <- post_sampling(
+    input.list = input_list,
+    n.samp = 1000,
+    max.batch = 1000,
+    ncore = 2)
+  
+  # mean posterior estimates
+  post.estimates <- apply(post.samp, 2, mean)
+  
+  return(list(post.estimates, post.list))
+}
+
+
+
+# function to find the optimal number of clusters of a earthquake sequence
+# with respect to time. This metric is ultimately NOT reported in the final
+# dissertation
+optimal_clusters <- function(time){
+  previous_twss <- kmeans(time, 1)$tot.withinss # initialisation
+  for (i in 2:30){
+    twss <- kmeans(time,i)$tot.withinss # total within cluster sum of squares
+    improvement <- (previous_twss - twss) / previous_twss # compute improvement
+    previous_twss <- twss
+    
+    # stop the algorithm if adding a cluster does not improve the twss by at
+    # least 30%
+    if (improvement < 0.4){
+      return(i - 1)
+    }
+  }
+  return(30)
+}
+
+
+
+# another clustering algorithm: what is the highest proportion of data points
+# that can be captured within a fixed-width 10% window of time? 
+# What time does that occur?
+window_cluster <- function(time, window_size = 0.1){
+  time.length <- max(time) - min(time)
+  window <- time.length * window_size
+  
+  # find the proportion of data between two bounds for a list of times
+  data_proportion <- function(lower, upper, t = time){
+    return(sum(t >= lower & t <= upper) / length(t))
+  }
+  
+  lbs <- seq(min(time),max(time) - window, 0.25)
+  ubs <- seq(window+min(time), max(time), 0.25)
+  results <- rep(0, length(lbs))
+  for (i in 1:length(lbs)){
+    results[i] <- data_proportion(lbs[i], ubs[i])
+  }
+  return(list(lbs[which.max(results)], max(results)))
+}
+
+
+
+# function to quantify various characteristics
+quantify_sequence <- function(df){
+  
+  # record total number of events
+  events <- length(df[[1]])
+  
+  # record number of large events, according to 5 as a cutoff
+  large_events_5 <- length(df[df[[2]] > 5,2])
+  
+  # record time of first large event, according to 5 as a cutoff
+  first_LE_5 <- df[df[[2]] > 5,][1,1]
+  
+  # record number of large events, according to 4 as a cutoff
+  large_events_4 <- length(df[df[[2]] > 4,2])
+  
+  # record time of first large event, according to 4 as a cutoff
+  first_LE_4 <- df[df[[2]] > 4,][1,1]
+  
+  # record number of clusters in events with respect to time
+  clusters.time <- optimal_clusters(df$ts)
+  
+  # record number of clusters in events with respect to magnitude
+  clusters.magnitude <- optimal_clusters(df$ts)
+  
+  # record maximum magnitude
+  max_magnitude <- max(df$magnitudes)
+  
+  # get window cluster results
+  window_cluster_results <- window_cluster(df$ts)
+  time_of_max_window_cluster <- window_cluster_results[[1]]
+  max_window_cluster <- window_cluster_results[[2]]
+  
+  # compile results
+  ret <- data.frame(events = events, large_events_5 = large_events_5,
+                    first_LE_5 = first_LE_5, large_events_4 = large_events_4,
+                    first_LE_4 = first_LE_4, clusters.time = clusters.time,
+                    clusters.magnitude = clusters.magnitude,
+                    max_magnitude = max_magnitude, 
+                    time_of_max_window_cluster = time_of_max_window_cluster,
+                    max_window_cluster = max_window_cluster)
+  return(ret)
+}
+
+
+
+# function to perform stratified sampling on an input dataframe (according
+# to the specified input metric). Then, the function plots the posteriors
+# of an input parameter at the selected levels of the metric
+stratified_sample_then_plot <- function(metric, df, post = post.df, 
+                                        true = true.params){
+  
+  # omit the 33rd observation, which has irregular posteriors
+  post <- post[-c(33)]
+  df <- df[-c(33),]
+  
+  # arrange the list of posterior dataframes in ascending order with respect
+  # to the input metric
+  post <- post[order(df[[metric]])]
+  
+  # store the true parameter values
+  df.true.param <- data.frame(
+    x = unlist(true),
+    param = names(true)
+  )
+  
+  samples <- rep(0,5) # storage for selected samples
+  for (i in 1:5){
+    lb <- (i-1)*7 + 1
+    ub <- 7*i
+    samples[i] <- sample(lb:ub, 1)
+  }
+  
+  # prepare to extract the 5 posterior dataframes into one dataframe
+  post.sub <- post[samples]
+  len <- length(post.sub[[1]]$post.df$x)
+  post.bind <- data.frame(matrix(0,len, 4))
+  lbl <- paste(metric,"Strata")
+  colnames(post.bind) <- c("x","y","param",lbl) 
+  
+  # specify the names of the 5 categories for the plots
+  strata <- c("Stratum 1", "Stratum 2","Stratum 3", "Stratum 4","Stratum 5")
+  
+  # extract posterior dfs into one df
+  for (i in 1:5){
+    lb <- (i-1)*len + 1
+    ub <- i*len
+    post.bind[lb:ub,1:3] <- post.sub[[i]]$post.df
+    post.bind[lb:ub,4] <- strata[i]
+  }
+  
+  # create ggplot object according to the input metric. Convert the label into
+  # a variable to pass into the aesthetic argument
+  gplot <- ggplot(post.bind, aes(x = x, y = y, color = !!sym(lbl))) +
+    geom_line() +
+    facet_wrap(facets = ~param, scales = "free") +
+    xlab("param") +
+    ylab("pdf") +
+    geom_vline(
+      data = df.true.param,
+      mapping = aes(xintercept = x), linetype = 2
+    )
+  gplot
+} 
+
+
+
+# return a ggplot object that plots the posterior mean errors of a parameter
+# against a characteristic. The 33rd observation is removed by default as it corresponds to
+# posteriors that appear do not appear to have been computed correctly
+gg_pme <- function(metric, parameter, df = err,removal = c(33)){
+  
+  mtc <- metric
+  df <- df[-removal,] # remove data points that arose from errors
+  
+  # print the greek character if the parameter input is alpha or mu
+  param <- parameter
+  if (parameter == "alpha"){
+    param <- "alpha" # can't knit the r code with this as the greek symbol
+  } else if (parameter == "mu"){
+    param <- "mu" # can't knit the r code with this as the greek symbol
+  }
+  
+  ylab <- paste("Relative error of estimate for",param)
+  lt <- paste("Relative error of",param, "estimate")
+  x <- df[, c(metric)]
+  
+  # event characteristic
+  gplot <- ggplot(df, aes(x = x,y = df[, c(parameter)], linetype = lt), color = "black") + 
+    theme(axis.text=element_text(size=13), axis.title=element_text(size=13)) + 
+    geom_point() + labs(x = mtc, y = ylab, size = 1.1) +
+    geom_hline(aes(yintercept = 0, linetype = "Zero relative error"), color = "red") + 
+    geom_smooth(method = 'lm',se = FALSE, aes(linetype = "Trendline")) +
+    scale_linetype_manual(name = "legend", values = c(1, 1, 2), 
+                          guide = guide_legend(override.aes =list(color = c("black", "blue","red"))))
+  return(gplot)
+}
+
+
+
+# function to set priors for model fitting. The defaults are considered the
+# "default non-informative priors"
+set_priors <- function(mu_gamma1=0.3, mu_gamma2=0.6, K_U1=0, K_U2=10, 
+                       alpha_U1=0, alpha_U2=10, c_U1 = 0, c_U2 = 10, 
+                       p_U1 = 1, p_U2 = 10, set_mu_to_unif = FALSE,
+                       mu_init = 0.5, K_init = 0.1, alpha_init = 1, 
+                       c_init = 0.1, p_init = 1.1){
+  
+  # set copula transformations list
+  link.f <<- list(
+    mu = \(x) gamma_t(x, mu_gamma1, mu_gamma2),
+    K = \(x) unif_t(x, K_U1, K_U2),
+    alpha = \(x) unif_t(x, alpha_U1, alpha_U2),
+    c_ = \(x) unif_t(x, c_U1, c_U2),
+    p = \(x) unif_t(x, p_U1, p_U2)
+  )
+  # set inverse copula transformations list
+  inv.link.f <<- list(
+    mu = \(x) inv_gamma_t(x, mu_gamma1, mu_gamma2),
+    K = \(x) inv_unif_t(x, K_U1, K_U2),
+    alpha = \(x) inv_unif_t(x, alpha_U1, alpha_U2),
+    c_ = \(x) inv_unif_t(x, c_U1, c_U2),
+    p = \(x) inv_unif_t(x, p_U1, p_U2)
+  )
+  
+  # set up list of initial values
+  th.init <<- list(
+    th.mu = inv.link.f$mu(mu_init),
+    th.K = inv.link.f$K(K_init),
+    th.alpha = inv.link.f$alpha(alpha_init),
+    th.c = inv.link.f$c_(c_init),
+    th.p = inv.link.f$p(p_init)
+  )
+  
+  # option to set mu's prior to be uniform if it is the "mis-specified" parameter
+  if (set_mu_to_unif){
+    link.f <<- list(
+      mu = \(x) unif_t(x, mu_gamma1, mu_gamma2),
+      K = \(x) unif_t(x, K_U1, K_U2),
+      alpha = \(x) unif_t(x, alpha_U1, alpha_U2),
+      c_ = \(x) unif_t(x, c_U1, c_U2),
+      p = \(x) unif_t(x, p_U1, p_U2)
+    )
+    # set inverse copula transformations list
+    inv.link.f <<- list(
+      mu = \(x) inv_unif_t(x, mu_gamma1, mu_gamma2),
+      K = \(x) inv_unif_t(x, K_U1, K_U2),
+      alpha = \(x) inv_unif_t(x, alpha_U1, alpha_U2),
+      c_ = \(x) inv_unif_t(x, c_U1, c_U2),
+      p = \(x) inv_unif_t(x, p_U1, p_U2)
+    )
+  }
+  
+  # set up list of bru options
+  bru.opt.list <<- list(
+    bru_verbose = 1, # type of visual output
+    bru_max_iter = 70, # maximum number of iterations
+    # bru_method = list(max_step = 0.5),
+    bru_initial = th.init # parameters' initial values
+  )
+}
+set_priors() # initialise the priors to the default non-informative setting
+
+
+
+# function that can be used inside lapplys to apply a mean with na.rm set true
+mean_no_na <- function(x){
+  return(mean(x, na.rm = TRUE))
+}
+```
+
+## This section is for computing results (or loading files if they already exist). The results are displayed in the next section
+
+Extract the L'Aquila Sequence from the Horus Dataset
+
+```{r, warning = FALSE, message=FALSE}
+
+# if the aquila.bru file exists, skip the computation and load it
+if(!file.exists("aquila_bru.rds")){
+  # transform time string in Date object
+  horus$time_date <- as.POSIXct(
+    horus$time_string,
+    format = "%Y-%m-%dT%H:%M:%OS"
+  )
+  # There may be some incorrectly registered data-times in the original data set,
+  # that as.POSIXct() can't convert, depending on the system.
+  # These should ideally be corrected, but for now, we just remove the rows that
+  # couldn't be converted.
+  horus <- na.omit(horus)
+  
+  # set up parameters for selection
+  start.date <- as.POSIXct("2009-01-01T00:00:00", format = "%Y-%m-%dT%H:%M:%OS")
+  end.date <- as.POSIXct("2010-01-01T00:00:00", format = "%Y-%m-%dT%H:%M:%OS")
+  min.longitude <- 10.5
+  max.longitude <- 16
+  min.latitude <- 40.5
+  max.latitude <- 45
+  M0 <- 2.5
+  
+  # set up conditions for selection
+  aquila.sel <- (horus$time_date >= start.date) &
+    (horus$time_date < end.date) &
+    (horus$lon >= min.longitude) &
+    (horus$lon <= max.longitude) &
+    (horus$lat >= min.latitude) &
+    (horus$lat <= max.latitude) &
+    (horus$M >= M0)
+  
+  # select
+  aquila <- horus[aquila.sel, ]
+  
+  # set up data.frame for model fitting
+  aquila.bru <- data.frame(
+    ts = as.numeric(
+      difftime(aquila$time_date, start.date, units = "days")
+    ),
+    magnitudes = aquila$M,
+    idx.p = 1:nrow(aquila)
+  )
+  
+  # save aquila data
+  saveRDS(aquila.bru, file = "aquila_bru.rds")
+} else {
+  aquila.bru <- readRDS("aquila_bru.rds")
+}
+```
+
+Fit an ETAS model to the real data
+
+```{r, warning=FALSE, message=FALSE}
+
+# if the true parameters have already been computed, skip the computation
+# and load them
+if(!file.exists("true_params.rds")){
+  
+  set.seed(111)
+  
+  set_priors()
+  
+  # set starting and time of the time interval used for model fitting. In this 
+  # case, we use the interval covered by the data.
+  T1 <- 0
+  T2 <- max(aquila.bru$ts) + 0.2
+  
+  # fit the model
+  aquila.fit <- Temporal.ETAS(
+    total.data = aquila.bru,
+    M0 = M0,
+    T1 = T1,
+    T2 = T2,
+    link.functions = link.f,
+    coef.t. = 1,
+    delta.t. = 0.1,
+    N.max. = 5,
+    bru.opt = bru.opt.list
+  )
+  
+  # # # # check Real Data model fitting results
+  # create input list to explore model output
+  input_list <- list(
+    model.fit = aquila.fit,
+    link.functions = link.f
+  )
+  
+  # get marginal posterior information
+  post.list <- get_posterior_param(input.list = input_list)
+  
+  # Get posterior samples from real data
+  post.samp <- post_sampling(
+    input.list = input_list,
+    n.samp = 1000,
+    max.batch = 1000,
+    ncore = 2 # default
+  )
+  
+  # mean posterior estimates
+  post.estimates <- apply(post.samp, 2, mean)
+  print(post.estimates)
+  saveRDS(post.estimates, file = "true_params.rds")
+  
+} else {
+  true.params <- readRDS("true_params.rds")
+}
+```
+
+Simulate Different Scenarios - the goal is to determine which scenarios
+correspond to good / bad estimates for model parameters. For this, many
+different types of earthquake sequences will be needed.
+
+```{r, warning=FALSE, message=FALSE}
+
+# check if it is necessary to re-run this code chunk. If not, skip and just
+# load the files
+skip <- all(c(file.exists("synths_reduced.rds"),file.exists("post_df.rds"),
+              file.exists("chars_reduced.rds"),file.exists("err.rds"),
+              file.exists('synth_char.rds')))
+
+if (!skip){
+  # generate 1500 organic datasets
+  set.seed(5) # original seed was 4
+  ht <- rep(list(NULL), 1500)
+  synths <- lapply(ht, gen.ETAS)
+  
+  # storage for synthetic dataset characteristics
+  synth.char <- data.frame(matrix(0,1500,10))
+  colnames(synth.char) <- 
+    c("Events", "Large Events 5", "First Large Event 5", "Large Events 4",
+      "First Large Event 4",  "Time Clusters", "Magnitude Clusters", 
+      "Max Magnitude", "Time of Max Cluster Window", "Max Cluster Window")
+  
+  # compute and then record characteristics of synthetic datasets
+  chars <- lapply(synths, quantify_sequence)
+  for (i in 1:length(chars)){
+    synth.char[i,1:10] <- chars[[i]]  
+  }
+  
+  # remove event outliers from the characterstic dataframe as well as the
+  # synthetic datasets themselves
+  keep_indexes <- synth.char$Events < mean(synth.char$Events,na.rm =TRUE) + 
+    1.96*sd(synth.char$Events, na.rm = TRUE)
+  synth.char<-synth.char[keep_indexes,]
+  synths <- synths[keep_indexes]
+  
+  # the goal is to get a "diverse" selection of catalogues. The most important
+  # criteria seems to be event -->
+  # event cutoffs:
+  # 0 - 100
+  # 100 - 200
+  # 200 - 300
+  # 300 - 400
+  # 400 - 500
+  # 500 - 600
+  # 600 - 700
+  # 700 - 800
+  # 800 - 900
+  
+  lb <- c(0, 100, 200, 300, 400, 500, 600, 700, 800) # lower bounds
+  ub <- c(100, 200, 300, 400, 500, 600, 700, 800, 900) # upper bounds
+  
+  # select 4 synthetic datasets from each category
+  synths.reduced <- rep(list(0), 36) # storage
+  chars.reduced <- data.frame(matrix(0,36,15))
+  colnames(chars.reduced) <- 
+    c("Events", "Large Events 5", "First Large Event 5", "Large Events 4",
+      "First Large Event 4",  "Time Clusters", "Magnitude Clusters", 
+      "Max Magnitude", "Time of Max Cluster Window", "Max Cluster Window",
+      "mu","K","alpha","c","p")
+  
+  count <- 1
+  for (i in 1:9){
+    
+    # take the indexes of 4 random samples per category
+    indexes <- which(synth.char$Events > lb[i] & synth.char$Events <= ub[i])
+    samples <- sample(indexes, 4)
+    
+    # extract the corresponding characteristics and datasets
+    chars.temp <- synth.char[samples,]
+    synth.temp <- synths[samples]
+    
+    # store the results
+    chars.reduced[count:(count + 4),1:10] <- chars.temp
+    synths.reduced[count:(count+4)] <- synth.temp
+    
+    count <- count + 4
+  }
+  
+  saveRDS(synths.reduced, "synths_reduced.rds")
+  saveRDS(synth.char, "synth_char.rds")
+  
+  # compute posterior parameter estimates and plots
+  post.estimates <- data.frame(matrix(0,36,5)) # storage for param estimates
+  post.df <- rep(list(0),36) # storage for posterior plot data
+  for (i in 1:36){
+    posterior.fit <- fit.ETAS(synths.reduced[[i]]) # fit model
+    post.estimates[i,] <- posterior.fit[[1]] # store estimates
+    post.df[[i]] <- posterior.fit[[2]] # store plot data
+  }
+  
+  # save results
+  saveRDS(post.df, "post_df.rds")
+  
+  # record the posterior estimates
+  chars.reduced[,11:15] <- post.estimates
+  saveRDS(chars.reduced, file = "chars_reduced.rds")
+  
+  # make new dataframe to store errors
+  err <- chars.reduced
+  err[,11:15] <- (chars.reduced[,11:15] - true.params) / true.params
+  saveRDS(err, file = "err.rds")
+} else {
+  synths.reduced <- readRDS("synths_reduced.rds")
+  post.df <- readRDS("post_df.rds")
+  chars.reduced <- readRDS("chars_reduced.rds")
+  err <- readRDS("err.rds")
+  synth.char <- readRDS("synth_char.rds")
+}
+```
+
+Try setting a narrow prior around the incorrect value for one parameter at a
+time while keeping non-informative priors for the other parameters. Which
+parameters need to be "correct" in order for the other estimates to be okay?
+Systematically misspecify parameters
+
+```{r, warning=FALSE, message=FALSE}
+
+filenames <- c("true_params.rds", "real_base_dfs.rds",
+               "mu_results_low.rds", "mu_dfs_low.rds",
+               "K_results_low.rds", "K_dfs_low.rds",
+               "alpha_results_low.rds", "alpha_dfs_low.rds",
+               "c_results_low.rds", "c_dfs_low.rds",
+               "p_results_low.rds", "p_dfs_low.rds",
+               "mu_results_high.rds", "mu_dfs_high.rds",
+               "K_results_high.rds", "K_dfs_high.rds",
+               "alpha_results_high.rds", "alpha_dfs_high.rds",
+               "c_results_high.rds", "c_dfs_high.rds",
+               "p_results_high.rds", "p_dfs_high.rds")
+
+file_check <- all(unlist(lapply(filenames, file.exists)))
+
+# if all the files already exist, skip the code and load the files. Else,
+# run the code and store the files
+
+if (!file_check){
+  # compute the parameter estimates for the real data
+  set_priors()
+  post <- fit.ETAS(aquila.bru)
+  base_results <- post[[1]] # extract posterior estimates
+  base_dfs <- post[[2]] # extract posterior samples
+  save(base_results, file = "real_base_results.RData")
+  save(base_dfs, file = "real_base_dfs.RData")
+  
+  # mis-specify mu to be low
+  set_priors(mu_gamma1 = 0.14, mu_gamma2 = 0.16, set_mu_to_unif = TRUE, 
+             mu_init = 0.15)
+  post <- fit.ETAS(aquila.bru)
+  mu_results_low <- post[[1]] # extract posterior estimates
+  mu_dfs_low <- post[[2]] # extract posterior samples
+  save(mu_results_low, file = "mu_results_low.RData")
+  save(mu_dfs_low, file = "mu_results_low.RData")
+  
+  # mis-specify K to be low
+  set_priors(K_U1 = 0.06, K_U2 = 0.08, set_mu_to_unif = FALSE, 
+             K_init = 0.07)
+  post <- fit.ETAS(aquila.bru)
+  K_results_low <- post[[1]] # extract posterior estimates
+  K_dfs_low <- post[[2]] # extract posterior samples
+  save(K_results_low, file = "K_results_low.RData")
+  save(K_dfs_low, file = "K_results_low.RData")
+  
+  # mis-specify alpha to be low
+  set_priors(alpha_U1 = 1.11, alpha_U2 = 1.13, set_mu_to_unif = FALSE, 
+             alpha_init = 1.12)
+  post <- fit.ETAS(aquila.bru)
+  alpha_results_low <- post[[1]] # extract posterior estimates
+  alpha_dfs_low <- post[[2]] # extract posterior samples
+  save(alpha_results_low, file = "alpha_results_low.RData")
+  save(alpha_dfs_low, file = "alpha_results_low.RData")
+  
+  # mis-specify c to be low
+  set_priors(c_U1 = 0.034, c_U2 = 0.036, set_mu_to_unif = FALSE, 
+             c_init = 0.035)
+  post <- fit.ETAS(aquila.bru)
+  c_results_low <- post[[1]] # extract posterior estimates
+  c_dfs_low <- post[[2]] # extract posterior samples
+  save(c_results_low, file = "c_results_low.RData")
+  save(c_dfs_low, file = "c_results_low.RData")
+  
+  # mis-specify p to be low
+  set_priors(p_U1 = 0.58, p_U2 = 0.60, set_mu_to_unif = FALSE, 
+             p_init = 0.59)
+  post <- fit.ETAS(aquila.bru)
+  p_results_low <- post[[1]] # extract posterior estimates
+  p_dfs_low <- post[[2]] # extract posterior samples
+  save(p_results_low, file = "p_results_low.RData")
+  save(p_dfs_low, file = "p_results_low.RData")
+  
+  #############################################################################
+  
+  # mis-specify mu to be high
+  set_priors(mu_gamma1 = 0.59, mu_gamma2 = 0.61, set_mu_to_unif = TRUE, 
+             mu_init = 0.6)
+  post <- fit.ETAS(aquila.bru)
+  mu_results_high <- post[[1]] # extract posterior estimates
+  mu_dfs_high <- post[[2]] # extract posterior samples
+  save(mu_results_high, file = "mu_results_high.RData")
+  save(mu_dfs_high, file = "mu_results_high.RData")
+  
+  # mis-specify K to be high
+  set_priors(K_U1 = 0.27, K_U2 = 0.29, set_mu_to_unif = FALSE, 
+             K_init = 0.28)
+  post <- fit.ETAS(aquila.bru)
+  K_results_high <- post[[1]] # extract posterior estimates
+  K_dfs_high <- post[[2]] # extract posterior samples
+  save(K_results_high, file = "K_results_high.RData")
+  save(K_dfs_high, file = "K_results_high.RData")
+  
+  # mis-specify alpha to be high
+  set_priors(alpha_U1 = 4.8, alpha_U2 = 4.9, set_mu_to_unif = FALSE, 
+             alpha_init = 4.85)
+  post <- fit.ETAS(aquila.bru)
+  alpha_results_high <- post[[1]] # extract posterior estimates
+  alpha_dfs_high <- post[[2]] # extract posterior samples
+  save(alpha_results_high, file = "alpha_results_high.RData")
+  save(alpha_dfs_high, file = "alpha_results_high.RData")
+  
+  # mis-specify c to be high
+  set_priors(c_U1 = 0.13, c_U2 = 0.15, set_mu_to_unif = FALSE, 
+             c_init = 0.14)
+  post <- fit.ETAS(aquila.bru)
+  c_results_high <- post[[1]] # extract posterior estimates
+  c_dfs_high <- post[[2]] # extract posterior samples
+  save(c_results_high, file = "c_results_high.RData")
+  save(c_dfs_high, file = "c_results_high.RData")
+  
+  # mis-specify p to be high
+  set_priors(p_U1 = 2.35, p_U2 = 2.36, set_mu_to_unif = FALSE, 
+             p_init = 2.355)
+  post <- fit.ETAS(aquila.bru)
+  p_results_high <- post[[1]] # extract posterior estimates
+  p_dfs_high <- post[[2]] # extract posterior samples
+  save(p_results_high, file = "p_results_high.RData")
+  save(p_dfs_high, file = "p_results_high.RData")
+  
+} else{
+  
+  true.params <- readRDS(file = "true_params.rds")
+  real_base_dfs <- readRDS(file = "real_base_dfs.rds")
+  mu_results_low <- readRDS(file = "mu_results_low.rds")
+  mu_dfs_low <- readRDS(file = "mu_dfs_low.rds")
+  K_results_low <- readRDS(file = "K_results_low.rds")
+  K_dfs_low <- readRDS(file = "K_dfs_low.rds")
+  alpha_results_low <- readRDS(file = "alpha_results_low.rds")
+  alpha_dfs_low <- readRDS(file = "alpha_dfs_low.rds")
+  c_results_low <- readRDS(file = "c_results_low.rds")
+  c_dfs_low <- readRDS(file = "c_dfs_low.rds")
+  p_results_low <- readRDS(file = "p_results_low.rds")
+  p_dfs_low <- readRDS(file = "p_dfs_low.rds")
+  
+  mu_results_high <- readRDS(file = "mu_results_high.rds")
+  mu_dfs_high <- readRDS(file = "mu_dfs_high.rds")
+  K_results_high <- readRDS(file = "K_results_high.rds")
+  K_dfs_high <- readRDS(file = "K_dfs_high.rds")
+  alpha_results_high <- readRDS(file = "alpha_results_high.rds")
+  alpha_dfs_high <- readRDS(file = "alpha_dfs_high.rds")
+  c_results_high <- readRDS(file = "c_results_high.rds")
+  c_dfs_high <- readRDS(file = "c_dfs_high.rds")
+  p_results_high <- readRDS(file = "p_results_high.rds")
+  p_dfs_high <- readRDS(file = "p_dfs_high.rds")
+}
+```
+
+## Results and plotting section
+
+Examine the behaviour of unrestricted parameter posteriors when other parameters
+are fixed
+
+```{r}
+
+# extract point estimates from a posterior dataframe
+extract_pe <- function(param, df = real_base_dfs){
+  df2 <- df$post.df[df$post.df$param == param,]
+  return(df2[which.max(df2$y),1])
+}
+
+real_true <- data.frame(matrix(0,1,5))
+colnames(real_true) <- c("mu","K","alpha","c","p")
+real_true[,1:5] <- unlist(lapply(c("mu","K","alpha","c","p"), extract_pe))
+
+# function that takes in the posterior dfs of free parameters who have been
+# impacted by a fixed parameter, and plots the posteriors of the free
+# parameters according to the low, real and high fixed values
+plot_low_real_high_posteriors <- function(param, low, high,real=real_base_dfs,
+                                          true = real_true){
+  
+  # store the true parameter values
+  df.true.param <- data.frame(
+    x = as.numeric(true[1:5]),
+    param = names(true)
+  )
+  
+  len <- length(low$post.df$x)
+  
+  # storage to unpack posterior dfs into
+  post.bind <- data.frame(matrix(0,len*3,4))
+  
+  # combine the posterior dfs into one dataframe for plotting purposes
+  lbl <- paste("Fixed",param, "Value")
+  colnames(post.bind) <- c("x","y","param",lbl)
+  post.bind[1:len,1:3] <- low$post.df
+  post.bind[1:len,4] <- paste("1/2 of",param,"Point Estimate")
+  post.bind[(len+1):(len*2),1:3] <- real$post.df
+  post.bind[(len+1):(len*2),4] <- paste(param,"Not Restricted")
+  post.bind[(2*len+1):(len*3),1:3] <- high$post.df
+  post.bind[(2*len+1):(len*3),4] <- paste("2x",param,"Point Estimate")
+  
+  # use ggplot to plot multiple posteriors on the same figure
+  gplot <- ggplot(post.bind, aes(x = x, y = y, color = !!sym(lbl))) +
+    geom_line() +
+    facet_wrap(facets = ~param, scales = "free") +
+    xlab("param") +
+    ylab("pdf") +
+    geom_vline(
+      data = df.true.param,
+      mapping = aes(xintercept = x), linetype = 2
+    )
+  
+  gplot 
+}
+
+plot_low_real_high_posteriors("mu", mu_dfs_low, mu_dfs_high)
+plot_low_real_high_posteriors("K", K_dfs_low, K_dfs_high)
+plot_low_real_high_posteriors("alpha",alpha_dfs_low, alpha_dfs_high)
+plot_low_real_high_posteriors("c", c_dfs_low, c_dfs_high)
+plot_low_real_high_posteriors("p", p_dfs_low, p_dfs_high)
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+fit <- Temporal.ETAS(
+  total.data <- aquila.bru,
+  M0 <- 2.5,
+  T1 <- 0,
+  T2 <- 365,
+  link.functions <- link.f,
+  coef.t. <- 1,
+  delta.t. <- 0.1,
+  n.max. <- 5,
+  bru.opt = bru.opt.list)
+
+# create input list
+input_list <- list(
+  model.fit = fit,
+  link.functions = link.f)
+
+# get marginal posterior information
+post.list <- get_posterior_param(input.list = input_list)
+
+# Get posterior samples from real data
+post.samp <- post_sampling(
+  input.list = input_list,
+  n.samp = 1000,
+  max.batch = 1000,
+  ncore = 2)
+
+# mean posterior estimates
+post.estimates <- apply(post.samp, 2, mean)
+post.sds <- apply(post.samp, 2, sd)
+
+
+low <- post.estimates - 3*post.sds
+high <- post.estimates + 3*post.sds
+
+
+set_priors(mu_gamma1 = 0.385, mu_gamma2 = 0.39, set_mu_to_unif = TRUE, mu_init = 0.387)
+mu_results_high <- fit.ETAS(aquila.bru)[[1]]
+
+set_priors(K_U1 = 0.2, K_U2 = 0.202, K_init = 0.201)
+K_results_high <- fit.ETAS(aquila.bru)[[1]]
+
+set_priors(alpha_U1 = 2.525, alpha_U2 = 2.53, alpha_init = 2.527)
+alpha_results_high <- fit.ETAS(aquila.bru)[[1]]
+
+set_priors(c_U1 = 0.11, c_U2 = 0.112, c_init = 0.111)
+c_results_high <- fit.ETAS(aquila.bru)[[1]]
+
+set_priors(p_U1 = 1.26, p_U2 = 1.264, p_init = 1.262)
+p_results_high <- fit.ETAS(aquila.bru)[[1]]
+
+
+reps <- 100
+Ht <- aquila.bru[which.max(aquila.bru$magnitudes),]
+
+mu.h <- unlist(lapply(rep(list(Ht), reps), perform_ks_with_synthetic, rep(mu_results_high,reps)))
+sum(mu.h) / reps
+
+K.h <- unlist(lapply(rep(list(Ht), reps), perform_ks_with_synthetic, rep(K_results_high,reps)))
+sum(K.h) / reps
+
+alpha.h <- unlist(lapply(rep(list(Ht), reps), perform_ks_with_synthetic, rep(alpha_results_high,reps)))
+sum(alpha.h) / reps
+
+c.h <- unlist(lapply(rep(list(Ht), reps), perform_ks_with_synthetic, rep(c_results_high,reps)))
+sum(c.h) / reps
+
+p.h <- unlist(lapply(rep(list(Ht), reps), perform_ks_with_synthetic, rep(p_results_high,reps)))
+sum(p.h) / reps
+
+
+
+```
+
+Investigate Event Inter-Arrival Times. How similar are the synthetic data
+inter-arrival times with real data? How realistic does the synthetic data look
+when it is generated based on unrestricted model fits from real data? How does
+the realism of the generated synthetic sequences change when p and K are
+purposely misspecified compared with when there are no parameter restrictions?
+
+```{r, warning=FALSE}
+
+files <- c("unrestricted_acc.rds","p_high_acc.rds","K_high_acc.rds")
+file_check <- all(unlist(lapply(files, file.exists)))
+
+# if the files exist, skip the code and load the files. If not, run the code
+if (!file_check){
+  # aquila differences in subsequent events
+  aquila.diffs <- aquila.bru[2:length(aquila.bru$ts),] - 
+    aquila.bru[1:(length(aquila.bru$ts)-1),]
+  
+  aquila.td <- aquila.diffs$ts # aquila time differences
+  
+  # compute the empirical CDF of the aquila data
+  sorted.td <- sort(aquila.td)
+  cdf_function <- ecdf(sorted.td)
+  x <- seq(0,5, 0.001)
+  cdf <- cdf_function(x)
+  
+  # function to generate a synthetic dataset and return its inter-arrival times
+  compute_IAT <- function(Ht, params) {
+    
+    # handle different types of input formats for model parameters
+    if (typeof(params) == "double"){
+      df <- gen.ETAS(Ht, mu = params[["mu"]], K = params[["K"]], 
+                     alpha = params[["alpha"]], c = params[["c"]],
+                     p = params[["p"]]) # generate synthetic dataset  
+    } else {
+      df <- gen.ETAS(Ht, mu = params$mu, K = params$K, alpha = params$alpha,
+                     c = params$c, p = params$p)} # generate synthetic dataset
+    
+    synth.diffs <- df[2:length(df$ts),] - df[1:(length(df$ts)-1),] 
+    synth.td <- synth.diffs$ts # time diffs
+    sorted.td <- sort(synth.td)
+    return(sorted.td)
+  }
+  
+  # function to compute the empirical cdf of sorted time differences
+  compute_ECDF <- function(sorted.td) {
+    cdf_function <- ecdf(sorted.td) 
+    x <- seq(0,5, 0.001)
+    synth.cdf <- cdf_function(x) # synthetic data empirical cdf
+    return(synth.cdf)
+  }
+  
+  # function to plot real vs synthetic cdfs
+  plot_cdfs <- function(x_in = x, real_in = real.cdf, synth_in = synth.cdf){
+    plot(x_in, real_in, type = "l", 
+         xlab = "Inter Event Times", ylab = "Empirical CDF Value")
+    lines(x_in, synth_in, type = "l", col = "red") 
+    legend <- c("L'Aquila Sequence Empirical CDF", "Synthetic Empirical CDF")
+    legend("bottomright", legend = legend, pch = c(16,16), col = c("black","red"))
+  }
+  
+  # plot code
+  Ht <- aquila.bru[which.max(aquila.bru$magnitudes),]
+  real.td <- sorted.td
+  real.cdf <- cdf
+  synth.td <- compute_IAT(Ht, true.params)
+  synth.cdf <- compute_ECDF(synth.td)
+  
+  plot_cdfs()
+  ks.test(real.td, synth.td, alternative = "two.sided")
+  
+  # function that generates a synthetic dataset and performs a KS test with the
+  # real data for IATs
+  perform_ks_with_synthetic <- function(Ht, params, real = real.td){
+    IAT.synth <- compute_IAT(Ht, params) # get synthetic IAT
+    ks <- ks.test(real, IAT.synth, alternative = "two.sided")
+    D <- ks$statistic[[1]] # test statistic
+    n <- length(IAT.synth)
+    m <- length(real)
+    rejection_region <- 1.96*sqrt((n + m)/(n*m))
+    
+    # the null hypothesis is that the two distributions come from the same
+    # underlying distribution. For the KS test, if the test statistic is less
+    # than the rejection region, then we cannot reject the null hypothesis
+    result <- D <= rejection_region 
+    return(result)
+  }
+  
+  reps <- 1000
+  
+  # compute results with unrestricted parameter estimates
+  unrestricted <- unlist(lapply(rep(list(Ht), reps), perform_ks_with_synthetic,
+                                rep(real_true,reps)))
+  
+  # compute results with p purposely misspecified to be high
+  p.high <- unlist(lapply(rep(list(Ht), reps), 
+                          perform_ks_with_synthetic, 
+                          rep(p_results_high,reps)))
+  
+  # compute results with K purposely misspecified to be high
+  K.high <- unlist(lapply(rep(list(Ht), reps), 
+                          perform_ks_with_synthetic, 
+                          rep(K_results_high,reps)))
+  
+  # proportion of times the synthetic datasets "looked like" real data
+  unrestricted.acc <- sum(unrestricted, na.rm = TRUE) / 
+    length(na.omit(unrestricted))
+  p.high.acc <- sum(p.high, na.rm = TRUE) / length(na.omit(p.high))
+  K.high.acc <- sum(K.high, na.rm = TRUE) / length(na.omit(K.high))
+  
+  # save accuracies
+  saveRDS(unrestricted.acc, file = "unrestricted_acc.rds")
+  saveRDS(p.high.acc, file = "p_high_acc.rds")
+  saveRDS(K.high.acc, file = "K_high_acc.rds")
+} else {
+  unrestricted.acc <- readRDS("unrestricted_acc.rds")
+  p.high.acc <- readRDS("p_high_acc.rds")
+  K.high.acc <- readRDS("K_high_acc.rds")
+}
+
+strng <- "Proportion of synthetic datasets that 'Looked Realistic' with no parameter restrictions:"
+print(paste(strng,signif(unrestricted.acc, 3)))
+
+strng <- "Proportion of synthetic datasets that 'Looked Realistic' with K misspecified to be double its true value:"
+print(paste(strng,signif(K.high.acc, 3)))
+
+strng <- "Proportion of synthetic datasets that 'Looked Realistic' with p misspecified to be double its true value:"
+print(paste(strng,signif(p.high.acc, 3)))
+```
+
+Plots involving the L'Aquila sequence
+
+```{r}
+
+######################## synthetic vs real buildup events plots ########
+set.seed(5)
+
+# real data, has buildup events
+df <- aquila.bru[aquila.bru$ts <= 95.023 & aquila.bru$ts > 30,]
+colors <- c(rep("black", 18), rep("red", 17), "blue")
+legend <- c("Buildup Events", "High Magnitude Event")
+legend_colors <- c("red","blue")
+
+# synthetic data, does not have buildup
+df.s <- gen.ETAS(aquila.bru[which.max(aquila.bru$magnitudes),])
+df.s <- df.s[df.s$ts <= 95.02269 & df.s$ts > 30,]
+colors2 <- c(rep("black",32),"blue")
+legend2 <- c("High Magnitude Imposed Event")
+legend_colors2 <- c("blue")
+
+# show buildup events
+par(mfrow = c(1, 2))
+plot(df$ts, df$magnitudes, 
+     main = "L'Aquila Sequence up until the L'Aquila Earthquake",
+     xlab = "Days since Jan 1st, 2009",
+     ylab = "Earthquake Magnitude", col = colors, pch = 16)
+legend("topleft", legend = legend, col = legend_colors, pch = 16, cex = 0.9,
+       bty = "n")
+
+# show lack of buildup events
+plot(df.s$ts, df.s$magnitudes, 
+     main = "Synthetic sequence up until the Imposed Event",
+     xlab = "Days",
+     ylab = "Earthquake Magnitude", col = colors2, pch = 16)
+legend("topleft", legend = legend2, col = legend_colors2, pch = 16, cex = 0.9,
+       bty = "n")
+
+############################ L'Aquila Plot ########################
+plot(aquila.bru$ts, aquila.bru$magnitudes, main = "The L'Aquila Sequence", 
+     xlab = "Days since Jan 1st, 2009",
+     ylab = "Earthquake Magnitude",  type = "l")
+
+
+########### Synthetic dataset that couldn't be fitted properly #############
+synth.bad <- synths.reduced[[33]]
+plot(synth.bad$ts, synth.bad$magnitudes, xlab = "Days", type = "l",
+     ylab = "Earthquake Magnitude", main = "Synthetic Dataset that the Model
+     Failed to Properly Fit")
+```
+
+Posterior Distributions vs Sequence Characteristics Results
+
+```{r, warning=FALSE}
+
+###### Plotting Posterior Point Estimate Reliability ##############
+
+# plots 6 combined ggplots on the same figure. The plots are the point
+# estimate relative errors for a parameter plotted against each characteristic
+combine_gg_plots <- function(param){
+  combined <- gg_pme("Events", param) + gg_pme("Large Events 4", param) +  
+    gg_pme("First Large Event 4", param) + gg_pme("Max Magnitude", param) + 
+    gg_pme("Time of Max Cluster Window",param)+gg_pme("Max Cluster Window",param)+ 
+    plot_layout(guides = "collect", nrow = 2, ncol = 3)
+  combined
+}
+
+# mu results
+combine_gg_plots("mu")
+
+# K results
+combine_gg_plots("K")
+
+# alpha results
+combine_gg_plots("alpha")
+
+# c results
+combine_gg_plots("c")
+
+# p results
+combine_gg_plots("p")
+
+######################################################################
+
+############## Plotting Individual Posterior Densities ##############
+set.seed(200)
+# Perform stratified random sampling and then plot the resulting posteriors
+# at different levels of a characteristic
+err.clean <- err[-c(33),]
+
+stratified_sample_then_plot("Events", df = err.clean)
+stratified_sample_then_plot("Large Events 4", df = err.clean)
+stratified_sample_then_plot("First Large Event 4", df = err.clean)
+stratified_sample_then_plot("Max Magnitude", df = err.clean)
+stratified_sample_then_plot("Time of Max Cluster Window", df = err.clean)
+stratified_sample_then_plot("Max Cluster Window", df = err.clean)
+```
+
+Section for Producing Figures for Latex
+
+```{r}
+# get a sample synthetic dataset
+synth.samp <- synths.reduced[[12]]
+
+# get its max cluster window results
+wc_result <- window_cluster(synth.samp$ts)
+window <- (max(synth.samp$ts) - min(synth.samp$ts)) / 10
+lower <- wc_result[[1]]
+upper <- wc_result[[1]] + window
+
+# plot for showing example of the max cluster window
+colors <- rep("darkgray", length(synth.samp$ts))
+colors[synth.samp$ts >= lower & synth.samp$ts <= upper] <- "blue"
+  legend = c("Events inside Max Cluster Window", "Start of Max Cluster Window",
+             "End of Max Cluster Window")
+  
+  plot(synth.samp$ts, synth.samp$magnitudes, type ="p", col = colors, pch = 20,
+       main = "Sample Synthetic Sequence Demonstrating the Max Cluster Window",
+       xlab = "Days", ylab = "Magnitude")
+  lines(c(lower, upper), rep(6, 2), type = "h", col = c("green","red"),
+        lwd = 2)
+  legend("topleft", legend = legend, col = c("blue","green","red"), 
+         pch = c(16,NA,NA), lty= c(NA,1,1), cex = 1.1, bty = "n")
+  
+  # excel files to latex tables
+  #post.estimates.latex <- xtable(signif(data.frame(true.params),4))
+  #strata.critera.latex <- xtable(strata_criteria)
+  #characteristics.descriptions.latex <- xtable(characteristics_descriptions)
+  #mis.low.latex <- xtable(mis_low)
+  #mis.high.latex <- xtable(mis_high)
+```
